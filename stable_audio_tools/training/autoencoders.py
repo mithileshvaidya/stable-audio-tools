@@ -1,8 +1,13 @@
+import io
 import os
 import torch
 import torchaudio
 import wandb
+import numpy as np
 import pytorch_lightning as pl
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from copy import deepcopy
 from typing import Optional, Literal
@@ -581,6 +586,85 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         else:
             torch.save({"state_dict": model.state_dict()}, path)
 
+def _rms(audio_tensor):
+    return torch.sqrt(torch.mean(audio_tensor.float() ** 2)).item()
+
+def swap_test(autoencoder, audio, swap_gains=None):
+    """Run the power-channel swap test on a single audio sample.
+
+    Encodes ``audio`` and ``g * audio`` for each gain ``g``, then measures how
+    decoded energy changes when swapping channel 0, all-but-channel-0, or all
+    channels between the original and gained latent representations.
+
+    Args:
+        autoencoder: An ``AudioAutoencoder`` instance (should have a VAE
+            bottleneck so that pre-bottleneck latents split into mean/scale).
+        audio: Tensor of shape ``[1, C, T]`` (single sample, already on the
+            correct device).
+        swap_gains: Optional sequence of float gain multipliers. Defaults to
+            ``np.arange(1.0, 4.01, 0.5)``.
+
+    Returns:
+        A ``matplotlib.figure.Figure`` with three subplots: decoded-energy
+        ratios, channel-0 latent norm, and channels-1..N latent norm.
+    """
+    if swap_gains is None:
+        swap_gains = np.round(np.arange(1.0, 4.01, 0.5), 1)
+
+    rms_full_gained = []
+    rms_swap_ch0 = []
+    rms_swap_rest = []
+    norm_ch0_list = []
+    norm_rest_list = []
+
+    with torch.inference_mode():
+        _, orig_info = autoencoder.encode(audio, return_info=True)
+        pre_bn_orig = orig_info["pre_bottleneck_latents"]
+        latent_dim = pre_bn_orig.shape[1] // 2
+        mean_orig = pre_bn_orig[:, :latent_dim, :]
+
+        for g in swap_gains:
+            gained_audio = audio * g
+            _, gained_info = autoencoder.encode(gained_audio, return_info=True)
+            pre_bn_gain = gained_info["pre_bottleneck_latents"]
+            mean_gain = pre_bn_gain[:, :latent_dim, :]
+
+            # All channels from gained
+            wav_full = autoencoder.decode(mean_gain)
+            rms_full_gained.append(_rms(wav_full))
+
+            # Swap only channel 0 from gained into original
+            m_swap0 = mean_orig.clone()
+            m_swap0[:, 0:1, :] = mean_gain[:, 0:1, :]
+            wav_s0 = autoencoder.decode(m_swap0)
+            rms_swap_ch0.append(_rms(wav_s0))
+
+            # Swap all channels except 0 from gained into original
+            m_swap_rest = mean_orig.clone()
+            m_swap_rest[:, 1:, :] = mean_gain[:, 1:, :]
+            wav_sr = autoencoder.decode(m_swap_rest)
+            rms_swap_rest.append(_rms(wav_sr))
+
+            norm_ch0_list.append(mean_gain[:, 0:1, :].norm().item())
+            norm_rest_list.append(mean_gain[:, 1:, :].norm().item())
+
+    ref_rms = rms_full_gained[0] if rms_full_gained[0] > 0 else 1e-8
+    ratio_full = np.array(rms_full_gained) / ref_rms
+    ratio_ch0 = np.array(rms_swap_ch0) / ref_rms
+    ratio_rest = np.array(rms_swap_rest) / ref_rms
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(swap_gains, ratio_full, "^-", label="All channels from g")
+    ax.plot(swap_gains, ratio_ch0, "s-", label="Swap ch0 from g, keep rest orig")
+    ax.plot(swap_gains, ratio_rest, "D-", label="Swap ch1..N from g, keep ch0 orig")
+    ax.axhline(1.0, color="k", linestyle=":", linewidth=0.8)
+    ax.set_xlabel("Input gain multiplier")
+    ax.set_ylabel("Output RMS / RMS@gain=1")
+    ax.set_title("PowerChannel swap test: decoded energy vs gain")
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    return fig
+
 class AutoencoderDemoCallback(pl.Callback):
     def __init__(
         self,
@@ -675,6 +759,15 @@ class AutoencoderDemoCallback(pl.Callback):
             log_point_cloud(trainer.logger, 'embeddings_3dpca', latents)
             log_image(trainer.logger, 'embeddings_spec', tokens_spectrogram_image(latents))
             log_image(trainer.logger, 'recon_melspec_left', audio_spectrogram_image(reals_fakes))
+
+            # Run swap test for PowerChannel models
+            if module.power_channels > 0:
+                ae = module.autoencoder_ema.ema_model if module.use_ema else module.autoencoder
+                sample = encoder_input[:1]
+                fig = swap_test(ae, sample)
+                log_image(trainer.logger, "swap_test", fig)
+                plt.close(fig)
+
         except Exception as e:
             print(f'{type(e).__name__}: {e}')
             raise e

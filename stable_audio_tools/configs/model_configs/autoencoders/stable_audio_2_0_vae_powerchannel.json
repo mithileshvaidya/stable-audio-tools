@@ -12,7 +12,8 @@
                 "c_mults": [1, 2, 4, 8, 16],
                 "strides": [2, 4, 4, 8, 8],
                 "latent_dim": 128,
-                "use_snake": true
+                "use_snake": true,
+                "use_rmsnorm": true
             }
         },
         "decoder": {
@@ -24,7 +25,8 @@
                 "strides": [2, 4, 4, 8, 8],
                 "latent_dim": 64,
                 "use_snake": true,
-                "final_tanh": false
+                "final_tanh": false,
+                "use_rmsnorm": true
             }
         },
         "bottleneck": {

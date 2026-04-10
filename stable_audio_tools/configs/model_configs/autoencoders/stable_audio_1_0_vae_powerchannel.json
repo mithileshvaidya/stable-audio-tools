@@ -10,7 +10,8 @@
                 "in_channels": 1,
                 "latent_dim": 128,
                 "d_model": 128,
-                "strides": [4, 4, 8, 8]
+                "strides": [4, 4, 8, 8],
+                "use_rmsnorm": true
             }
         },
         "decoder": {
@@ -19,7 +20,8 @@
                 "out_channels": 1,
                 "latent_dim": 64,
                 "channels": 1536,
-                "rates": [8, 8, 4, 4]
+                "rates": [8, 8, 4, 4],
+                "use_rmsnorm": true
             }
         },
         "bottleneck": {
@@ -110,7 +112,7 @@
                     "gain_db_max": 6
                 },
                 "weights": {
-                    "power_channel": 0.1
+                    "power_channel": 0.3
                 }
             }
         },
