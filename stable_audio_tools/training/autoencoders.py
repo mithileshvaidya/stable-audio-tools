@@ -682,6 +682,8 @@ class AutoencoderDemoCallback(pl.Callback):
         self.last_demo_step = -1
         self.max_demos = max_demos
 
+        self.pesq_metric = PESQMetric(sample_rate)
+
 
     @rank_zero_only
     def on_train_batch_end(self, trainer, module, outputs, batch, batch_idx):
@@ -759,6 +761,12 @@ class AutoencoderDemoCallback(pl.Callback):
             log_point_cloud(trainer.logger, 'embeddings_3dpca', latents)
             log_image(trainer.logger, 'embeddings_spec', tokens_spectrogram_image(latents))
             log_image(trainer.logger, 'recon_melspec_left', audio_spectrogram_image(reals_fakes))
+
+            # Reconstruction quality metric
+            with torch.no_grad():
+                pesq_val = self.pesq_metric(fakes, demo_reals)
+                if not (isinstance(pesq_val, float) and pesq_val != pesq_val):
+                    log_metric(trainer.logger, "demo/pesq", pesq_val)
 
             # Run swap test for PowerChannel models
             if module.power_channels > 0:

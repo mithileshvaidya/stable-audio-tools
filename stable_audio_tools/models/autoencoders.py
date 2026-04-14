@@ -22,14 +22,15 @@ from .transformer import ContinuousTransformer, TransformerBlock, RotaryEmbeddin
 
 class RMSNorm1d(nn.Module):
     """RMSNorm over the channel dimension for [B, C, T] tensors."""
-    def __init__(self, dim, eps=1e-8):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
         self.gamma = nn.Parameter(torch.ones(1, dim, 1))
 
     def forward(self, x):
-        rms = torch.sqrt(torch.mean(x.float() ** 2, dim=1, keepdim=True) + self.eps)
-        return (x / rms) * self.gamma
+        x_float = x.float()
+        rms = torch.sqrt(torch.mean(x_float ** 2, dim=1, keepdim=True) + self.eps)
+        return ((x_float / rms) * self.gamma).to(x.dtype)
 
 def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
@@ -302,7 +303,7 @@ class OobleckEncoder(nn.Module):
                  strides = [2, 4, 8, 8],
                  use_snake=False,
                  antialias_activation=False,
-                 use_rmsnorm=False
+                 **kwargs
         ):
         super().__init__()
         self.in_channels = in_channels
@@ -320,12 +321,8 @@ class OobleckEncoder(nn.Module):
 
         layers += [
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=c_mults[-1] * channels),
+            WNConv1d(in_channels=c_mults[-1]*channels, out_channels=latent_dim, kernel_size=3, padding=1)
         ]
-
-        if use_rmsnorm:
-            layers.append(RMSNorm1d(c_mults[-1] * channels))
-
-        layers.append(WNConv1d(in_channels=c_mults[-1]*channels, out_channels=latent_dim, kernel_size=3, padding=1))
 
         self.layers = nn.Sequential(*layers)
 
@@ -344,7 +341,7 @@ class OobleckDecoder(nn.Module):
                  antialias_activation=False,
                  use_nearest_upsample=False,
                  final_tanh=True,
-                 use_rmsnorm=False):
+                 **kwargs):
         super().__init__()
         self.out_channels = out_channels
 
@@ -355,9 +352,6 @@ class OobleckDecoder(nn.Module):
         layers = [
             WNConv1d(in_channels=latent_dim, out_channels=c_mults[-1]*channels, kernel_size=7, padding=3),
         ]
-
-        if use_rmsnorm:
-            layers.append(RMSNorm1d(c_mults[-1] * channels))
         
         for i in range(self.depth-1, 0, -1):
             layers += [DecoderBlock(
@@ -388,14 +382,12 @@ class DACEncoderWrapper(nn.Module):
 
         from dac.model.dac import Encoder as DACEncoder
 
-        use_rmsnorm = kwargs.pop("use_rmsnorm", False)
+        kwargs.pop("use_rmsnorm", None)
         latent_dim = kwargs.pop("latent_dim", None)
 
         encoder_out_dim = kwargs["d_model"] * (2 ** len(kwargs["strides"]))
         self.encoder = DACEncoder(d_latent=encoder_out_dim, **kwargs)
         self.latent_dim = latent_dim
-
-        self.rmsnorm = RMSNorm1d(self.encoder.enc_dim) if use_rmsnorm else nn.Identity()
 
         # Latent-dim support was added to DAC after this was first written, and implemented differently, so this is for backwards compatibility
         self.proj_out = nn.Conv1d(self.encoder.enc_dim, latent_dim, kernel_size=1) if latent_dim is not None else nn.Identity()
@@ -405,7 +397,6 @@ class DACEncoderWrapper(nn.Module):
 
     def forward(self, x):
         x = self.encoder(x)
-        x = self.rmsnorm(x)
         x = self.proj_out(x)
         return x
 
@@ -415,24 +406,13 @@ class DACDecoderWrapper(nn.Module):
 
         from dac.model.dac import Decoder as DACDecoder
 
-        use_rmsnorm = kwargs.pop("use_rmsnorm", False)
+        kwargs.pop("use_rmsnorm", None)
 
         self.decoder = DACDecoder(**kwargs, input_channel = latent_dim, d_out=out_channels)
 
         self.latent_dim = latent_dim
-        self.use_rmsnorm = use_rmsnorm
-
-        if use_rmsnorm:
-            wide_dim = kwargs["channels"]
-            self.rmsnorm = RMSNorm1d(wide_dim)
 
     def forward(self, x):
-        if self.use_rmsnorm:
-            x = self.decoder.model[0](x)
-            x = self.rmsnorm(x)
-            for layer in self.decoder.model[1:]:
-                x = layer(x)
-            return x
         return self.decoder(x)
 
 class AudioAutoencoder(nn.Module):
@@ -448,7 +428,8 @@ class AudioAutoencoder(nn.Module):
         pretransform: Pretransform = None,
         in_channels = None,
         out_channels = None,
-        soft_clip = False
+        soft_clip = False,
+        use_rmsnorm = False
     ):
         super().__init__()
 
@@ -477,6 +458,8 @@ class AudioAutoencoder(nn.Module):
         self.pretransform = pretransform
 
         self.soft_clip = soft_clip
+
+        self.latent_rmsnorm = RMSNorm1d(latent_dim) if use_rmsnorm else None
  
         self.is_discrete = self.bottleneck is not None and self.bottleneck.is_discrete
 
@@ -537,6 +520,9 @@ class AudioAutoencoder(nn.Module):
                 latents = torch.cat(decoded, dim=0)
             else:
                 latents = self.bottleneck.decode(latents)
+
+        if self.latent_rmsnorm is not None:
+            latents = self.latent_rmsnorm(latents)
 
         if iterate_batch:
             decoded = []
@@ -931,6 +917,7 @@ def create_autoencoder_from_config(config: Dict[str, Any]):
         bottleneck = create_bottleneck_from_config(bottleneck)
 
     soft_clip = ae_config["decoder"].get("soft_clip", False)
+    use_rmsnorm = ae_config.get("use_rmsnorm", False)
 
     return AudioAutoencoder(
         encoder,
@@ -943,7 +930,8 @@ def create_autoencoder_from_config(config: Dict[str, Any]):
         pretransform=pretransform,
         in_channels=in_channels,
         out_channels=out_channels,
-        soft_clip=soft_clip
+        soft_clip=soft_clip,
+        use_rmsnorm=use_rmsnorm
     )
 
 def create_diffAE_from_config(config: Dict[str, Any]):

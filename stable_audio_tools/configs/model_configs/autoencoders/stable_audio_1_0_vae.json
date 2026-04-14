@@ -10,8 +10,7 @@
                 "in_channels": 1,
                 "latent_dim": 128,
                 "d_model": 128,
-                "strides": [4, 4, 8, 8],
-                "use_rmsnorm": true
+                "strides": [4, 4, 8, 8]
             }
         },
         "decoder": {
@@ -20,8 +19,7 @@
                 "out_channels": 1,
                 "latent_dim": 64,
                 "channels": 1536,
-                "rates": [8, 8, 4, 4],
-                "use_rmsnorm": true
+                "rates": [8, 8, 4, 4]
             }
         },
         "bottleneck": {
@@ -30,7 +28,8 @@
         "latent_dim": 64,
         "downsampling_ratio": 1024,
         "io_channels": 1,
-        "power_channels": 0
+        "power_channels": 0,
+        "use_rmsnorm": true
     },
     "training": {
         "learning_rate": 1e-4,

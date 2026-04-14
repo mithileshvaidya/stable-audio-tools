@@ -1,10 +1,10 @@
 import torch
 import torchaudio
+from pesq import pesq, NoUtterancesError
 
 from torch.nn import functional as F
 from torch import nn
 
-### Metrics are loss-like functions that do not backpropagate gradients.
 
 class PESQMetric(nn.Module):
     def __init__(self, sample_rate: int):
@@ -14,16 +14,24 @@ class PESQMetric(nn.Module):
             if sample_rate != 16000 else None)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor):
+        inputs = inputs.detach().cpu().float()
+        targets = targets.detach().cpu().float()
+
         if self.resampler is not None:
             inputs = self.resampler(inputs)
             targets = self.resampler(targets)
 
-        inputs_np = inputs.cpu().numpy().astype("float64")
-        targets_np = targets.cpu().numpy().astype("float64")
+        inputs_np = inputs.numpy().astype("float64")
+        targets_np = targets.numpy().astype("float64")
         batch_size = targets.shape[0]
 
-        # Compute average pesq across batch size.
-        val_pesq = (1.0 / batch_size) * sum(
-            pesq(targets_np[i].reshape(-1), inputs_np[i].reshape(-1), 16000)
-            for i in range(batch_size))
-        return val_pesq
+        scores = []
+        for i in range(batch_size):
+            try:
+                scores.append(pesq(16000, targets_np[i].reshape(-1), inputs_np[i].reshape(-1), "wb"))
+            except NoUtterancesError:
+                continue
+
+        if not scores:
+            return float("nan")
+        return sum(scores) / len(scores)

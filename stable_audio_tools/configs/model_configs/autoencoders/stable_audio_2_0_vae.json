@@ -12,8 +12,7 @@
                 "c_mults": [1, 2, 4, 8, 16],
                 "strides": [2, 4, 4, 8, 8],
                 "latent_dim": 128,
-                "use_snake": true,
-                "use_rmsnorm": true
+                "use_snake": true
             }
         },
         "decoder": {
@@ -25,8 +24,7 @@
                 "strides": [2, 4, 4, 8, 8],
                 "latent_dim": 64,
                 "use_snake": true,
-                "final_tanh": false,
-                "use_rmsnorm": true
+                "final_tanh": false
             }
         },
         "bottleneck": {
@@ -35,7 +33,8 @@
         "latent_dim": 64,
         "downsampling_ratio": 2048,
         "io_channels": 1,
-        "power_channels": 0
+        "power_channels": 0,
+        "use_rmsnorm": true
     },
     "training": {
         "learning_rate": 1.5e-4,

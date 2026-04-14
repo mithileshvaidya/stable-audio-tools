@@ -1,5 +1,5 @@
 """
-Evaluate an unwrapped autoencoder model using ViSQOL.
+Evaluate an unwrapped autoencoder model using PESQ.
 
 Single-GPU usage:
     python evaluate_autoencoder.py \
@@ -11,15 +11,8 @@ Single-GPU usage:
         --max_samples 0          # 0 = use all samples
         --device cuda
 
-Multi-GPU usage (e.g. GPUs 4-7):
-    CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 evaluate_autoencoder.py \
-        --model_config ... --ckpt_path ... --dataset_config ...
-
-    You can also use a YAML config file:
-        python evaluate_autoencoder.py --args.load config.yml
-
 Requires:
-    pip install visqol argbind
+    pip install pesq argbind
 """
 
 import argbind
@@ -30,79 +23,32 @@ import sys
 import numpy as np
 import scipy.stats
 import torch
-import torch.distributed as dist
 import torchaudio
 import torchaudio.transforms as T
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from visqol import visqol_lib_py
-from visqol.pb2 import visqol_config_pb2, similarity_result_pb2
+from pesq import pesq
 
 from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models.factory import create_model_from_config
 from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict
 
 
-# ---------------------------------------------------------------------------
-# ViSQOL helpers
-# ---------------------------------------------------------------------------
-
-VISQOL_SAMPLE_RATE = 48000  # ViSQOL audio mode requires 48 kHz
+PESQ_SAMPLE_RATE = 16000
 
 
-def make_visqol_api(use_speech_mode: bool = False):
-    """Create and return a VisqolApi instance."""
-    config = visqol_config_pb2.VisqolConfig()
-    config.audio.sample_rate = VISQOL_SAMPLE_RATE
-    config.options.use_speech_scoring = use_speech_mode
-
-    if use_speech_mode:
-        svr_model_name = "lattice_tcditool_in_speech.tflite"
-    else:
-        svr_model_name = "libsvm_nu_svr_model.txt"
-
-    config.options.svr_model_path = os.path.join(
-        os.path.dirname(visqol_lib_py.__file__), "model", svr_model_name
-    )
-
-    api = visqol_lib_py.VisqolApi()
-    api.Create(config)
-    return api
-
-
-def compute_visqol(api, reference: np.ndarray, degraded: np.ndarray) -> float:
+def compute_pesq(reference: np.ndarray, degraded: np.ndarray) -> float:
+    """Compute wideband PESQ between a reference and degraded signal.
+    Both inputs should be 1-D float64 numpy arrays at 16 kHz.
     """
-    Compute ViSQOL MOS-LQO between a reference and degraded signal.
+    return pesq(PESQ_SAMPLE_RATE, reference, degraded, "wb")
 
-    Both inputs should be 1-D float64 numpy arrays at 48 kHz.
-    Returns the MOS-LQO score.
-    """
-    similarity_result = api.Measure(reference, degraded)
-    return similarity_result.moslqo
-
-
-# ---------------------------------------------------------------------------
-# Gain in dB
-# ---------------------------------------------------------------------------
 
 def gain_db(reference: np.ndarray, degraded: np.ndarray) -> float:
-    """Compute the gain in dB of *degraded* relative to *reference*.
-
-    gain_dB = 20 * log10(rms_degraded / rms_reference)
-
-    A positive value means the degraded signal is louder than the reference.
-    Both inputs should be 1-D float64 numpy arrays.
-    """
     return 10.0 * np.log10(np.mean(degraded ** 2) / (np.mean(reference ** 2) + 1e-12))
 
 
-# ---------------------------------------------------------------------------
-# Confidence interval
-# ---------------------------------------------------------------------------
-
 def mean_confidence_interval(data, confidence=0.95):
-    """Return (mean, ci_margin) for *data* at the given confidence level."""
     a = np.array(data, dtype=np.float64)
     n = len(a)
     mean = np.mean(a)
@@ -110,10 +56,6 @@ def mean_confidence_interval(data, confidence=0.95):
         return mean, 0.0
     return mean, scipy.stats.sem(a) * scipy.stats.t.ppf((1 + confidence) / 2.0, n - 1)
 
-
-# ---------------------------------------------------------------------------
-# Main evaluation loop
-# ---------------------------------------------------------------------------
 
 @argbind.bind(without_prefix=True)
 def evaluate(
@@ -124,54 +66,19 @@ def evaluate(
     num_workers: int = 6,
     max_samples: int = 0,
     device: str = "cuda",
-    speech_mode: bool = False,
     out_path: str = "",
     gain: float = 2.0,
 ):
-    """Evaluate an unwrapped autoencoder using ViSQOL (encode → decode → compare).
-
-    Supports single-GPU (``python``) and multi-GPU (``torchrun``) execution.
-
-    Args:
-        model_config: Path to the model config JSON (e.g. stable_audio_1_0_vae.json).
-        ckpt_path: Path to the unwrapped model checkpoint (.ckpt or .safetensors).
-        dataset_config: Path to the dataset config JSON.
-        batch_size: Batch size for inference (per GPU).
-        num_workers: Number of dataloader workers (per GPU).
-        max_samples: Maximum number of samples to evaluate. 0 = all.
-        device: Device to run the model on (ignored in multi-GPU mode).
-        speech_mode: Use ViSQOL speech mode instead of audio mode.
-        out_path: Directory to write original/reconstructed wav files for listening.
-        gain: Linear gain applied to audio for the swapped-latent experiment (default 2.0).
-    """
     assert model_config, "--model_config is required"
     assert ckpt_path, "--ckpt_path is required"
     assert dataset_config, "--dataset_config is required"
 
-    # ---- distributed setup ----
-    distributed = "LOCAL_RANK" in os.environ
-    if distributed:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
-        torch.cuda.set_device(device)
-    else:
-        rank = 0
-        world_size = 1
-
-    def log(msg):
-        """Print only on rank 0."""
-        if rank == 0:
-            print(msg)
-
     save_audio = bool(out_path)
-    if save_audio and rank == 0:
+    if save_audio:
         os.makedirs(os.path.join(out_path, "original"), exist_ok=True)
         os.makedirs(os.path.join(out_path, "reconstructed"), exist_ok=True)
         os.makedirs(os.path.join(out_path, "swapped"), exist_ok=True)
 
-    # ---- load configs ----
     with open(model_config) as f:
         model_cfg = json.load(f)
 
@@ -180,17 +87,14 @@ def evaluate(
     dataset_cfg["random_crop"] = True
     dataset_cfg["drop_last"] = False
 
-    # ---- build model and load weights ----
-    log("Creating model from config …")
+    print("Creating model from config ...")
     model = create_model_from_config(model_cfg)
-    log(f"Loading checkpoint from {ckpt_path} …")
+    print(f"Loading checkpoint from {ckpt_path} ...")
     copy_state_dict(model, load_ckpt_state_dict(ckpt_path))
     model.to(device).eval().requires_grad_(False)
-    log("Model ready.")
+    print("Model ready.")
 
-    # ---- build dataloader ----
-    # Use 10-second crops instead of the model's default sample_size
-    tmp_loader = create_dataloader_from_config(
+    data_loader = create_dataloader_from_config(
         dataset_cfg,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -200,32 +104,9 @@ def evaluate(
         shuffle=False,
     )
 
-    if distributed:
-        # Re-wrap the dataset with a DistributedSampler so each GPU
-        # processes a different shard of the data.
-        data_loader = DataLoader(
-            tmp_loader.dataset,
-            batch_size=batch_size,
-            sampler=DistributedSampler(tmp_loader.dataset, shuffle=False),
-            num_workers=num_workers,
-            pin_memory=True,
-        )
-        log(f"Distributed evaluation: {world_size} GPUs, "
-            f"{len(tmp_loader.dataset)} samples total.")
-    else:
-        data_loader = tmp_loader
+    resampler = (T.Resample(model_cfg["sample_rate"], PESQ_SAMPLE_RATE)
+                 if model_cfg["sample_rate"] != PESQ_SAMPLE_RATE else None)
 
-    # ---- set up ViSQOL (one instance per process) ----
-    log("Initialising ViSQOL …")
-    visqol_api = make_visqol_api(use_speech_mode=speech_mode)
-
-    # Resampler from model sample rate → 48 kHz (if needed)
-    if model_cfg["sample_rate"] != VISQOL_SAMPLE_RATE:
-        resampler = T.Resample(model_cfg["sample_rate"], VISQOL_SAMPLE_RATE)
-    else:
-        resampler = None
-
-    # ---- evaluation loop ----
     scores = []
     swapped_scores = []
     recon_gain_dbs = []
@@ -233,23 +114,19 @@ def evaluate(
     total_processed = 0
     effective_max = max_samples if max_samples > 0 else float("inf")
 
-    pbar = tqdm(data_loader, desc="Evaluating", unit="batch", disable=(rank != 0))
+    pbar = tqdm(data_loader, desc="Evaluating", unit="batch")
     for batch in pbar:
-        audio = batch[0].to(device)  # (B, C, T)
+        audio = batch[0].to(device)
 
         with torch.no_grad():
-            # Regular encode → decode
             latent = model.encode(audio)
             reconstructed = model.decode(latent)
 
-            # Gained-audio encode, swap first latent channel, decode
             latent_gained = model.encode(audio * gain)
             latent_gained[:, 0:1, :] = latent[:, 0:1, :]
             swapped = model.decode(latent_gained)
 
-        # Ensure outputs have the same length as original
         min_len = min(audio.shape[-1], reconstructed.shape[-1], swapped.shape[-1])
-        # Move to CPU for ViSQOL computation
         audio_cpu = audio[..., :min_len].cpu()
         reconstructed_cpu = reconstructed[..., :min_len].cpu()
         swapped_cpu = swapped[..., :min_len].cpu()
@@ -258,81 +135,53 @@ def evaluate(
             if total_processed >= effective_max:
                 break
 
-            # Mix down to mono (ViSQOL expects mono)
-            ref = audio_cpu[i].mean(dim=0)          # (T,)
-            deg = reconstructed_cpu[i].mean(dim=0)   # (T,)
-            deg_sw = swapped_cpu[i].mean(dim=0)      # (T,)
+            ref = audio_cpu[i].mean(dim=0)
+            deg = reconstructed_cpu[i].mean(dim=0)
+            deg_sw = swapped_cpu[i].mean(dim=0)
 
-            # Resample to 48 kHz if needed
             if resampler is not None:
                 ref = resampler(ref.unsqueeze(0)).squeeze(0)
                 deg = resampler(deg.unsqueeze(0)).squeeze(0)
                 deg_sw = resampler(deg_sw.unsqueeze(0)).squeeze(0)
 
-            # Convert to float64 numpy (ViSQOL requirement)
             ref_np = ref.numpy().astype(np.float64)
             deg_np = deg.numpy().astype(np.float64)
             deg_sw_np = deg_sw.numpy().astype(np.float64)
 
             try:
-                score = compute_visqol(visqol_api, ref_np, deg_np)
+                score = compute_pesq(ref_np, deg_np)
                 scores.append(score)
             except Exception as e:
-                print(f"\n[WARNING] ViSQOL failed on sample {total_processed} (reconstructed): {e}", file=sys.stderr)
+                print(f"\n[WARNING] PESQ failed on sample {total_processed} (reconstructed): {e}", file=sys.stderr)
 
             try:
-                sw_score = compute_visqol(visqol_api, ref_np, deg_sw_np)
+                sw_score = compute_pesq(ref_np, deg_sw_np)
                 swapped_scores.append(sw_score)
             except Exception as e:
-                print(f"\n[WARNING] ViSQOL failed on sample {total_processed} (swapped): {e}", file=sys.stderr)
+                print(f"\n[WARNING] PESQ failed on sample {total_processed} (swapped): {e}", file=sys.stderr)
 
-            # Gain in dB relative to the reference
             recon_gain_dbs.append(gain_db(ref_np, deg_np))
             swapped_gain_dbs.append(gain_db(ref_np, deg_sw_np))
 
             total_processed += 1
 
-            if save_audio and rank == 0:
+            if save_audio:
                 sr = model_cfg["sample_rate"]
                 torchaudio.save(os.path.join(out_path, "original", f"{total_processed:05d}.wav"), audio_cpu[i], sr)
                 torchaudio.save(os.path.join(out_path, "reconstructed", f"{total_processed:05d}.wav"), reconstructed_cpu[i], sr)
                 torchaudio.save(os.path.join(out_path, "swapped", f"{total_processed:05d}.wav"), swapped_cpu[i], sr)
 
-            # Update progress bar with running statistics
             if scores:
-                running_mean = np.mean(scores)
-                sw_mean = np.mean(swapped_scores) if swapped_scores else 0.0
-                r_gdb = np.mean(recon_gain_dbs) if recon_gain_dbs else 0.0
-                sw_gdb = np.mean(swapped_gain_dbs) if swapped_gain_dbs else 0.0
                 pbar.set_postfix(
-                    visqol=f"{running_mean:.4f}", swapped=f"{sw_mean:.4f}",
-                    r_dB=f"{r_gdb:+.2f}", sw_dB=f"{sw_gdb:+.2f}",
-                    n=f"~{len(scores) * world_size}",
+                    pesq=f"{np.mean(scores):.4f}",
+                    swapped=f"{np.mean(swapped_scores):.4f}" if swapped_scores else "n/a",
+                    r_dB=f"{np.mean(recon_gain_dbs):+.2f}",
+                    sw_dB=f"{np.mean(swapped_gain_dbs):+.2f}",
+                    n=len(scores),
                 )
 
         if total_processed >= effective_max:
             break
-
-    # ---- gather scores across all ranks ----
-    if distributed:
-        all_scores = [None] * world_size
-        all_swapped = [None] * world_size
-        all_recon_gdb = [None] * world_size
-        all_swapped_gdb = [None] * world_size
-        dist.all_gather_object(all_scores, scores)
-        dist.all_gather_object(all_swapped, swapped_scores)
-        dist.all_gather_object(all_recon_gdb, recon_gain_dbs)
-        dist.all_gather_object(all_swapped_gdb, swapped_gain_dbs)
-        # Flatten lists from all ranks
-        scores = [s for rank_scores in all_scores for s in rank_scores]
-        swapped_scores = [s for rank_scores in all_swapped for s in rank_scores]
-        recon_gain_dbs = [s for rank_scores in all_recon_gdb for s in rank_scores]
-        swapped_gain_dbs = [s for rank_scores in all_swapped_gdb for s in rank_scores]
-        dist.destroy_process_group()
-
-    # ---- report results (rank 0 only) ----
-    if rank != 0:
-        return
 
     if not scores and not swapped_scores:
         print("\nNo scores were computed. Check your dataset / model.")
@@ -342,44 +191,40 @@ def evaluate(
 
     if scores:
         mean, ci = mean_confidence_interval(scores, confidence=0.95)
-        print(f"  ViSQOL Evaluation – Reconstructed  ({len(scores)} samples)")
+        print(f"  PESQ Evaluation - Reconstructed  ({len(scores)} samples)")
         print("=" * 60)
-        print(f"  Mean MOS-LQO :  {mean:.4f} ± {ci:.4f}")
+        print(f"  Mean PESQ    :  {mean:.4f} +/- {ci:.4f}")
         print(f"  Std Dev      :  {np.std(scores):.4f}")
         print(f"  Min / Max    :  {np.min(scores):.4f} / {np.max(scores):.4f}")
         print("=" * 60)
 
     if recon_gain_dbs:
         gdb_mean, gdb_ci = mean_confidence_interval(recon_gain_dbs, confidence=0.95)
-        print(f"  Gain dB vs Reference – Reconstructed  ({len(recon_gain_dbs)} samples)")
+        print(f"  Gain dB vs Reference - Reconstructed  ({len(recon_gain_dbs)} samples)")
         print("=" * 60)
-        print(f"  Mean Gain dB :  {gdb_mean:+.4f} ± {gdb_ci:.4f}")
+        print(f"  Mean Gain dB :  {gdb_mean:+.4f} +/- {gdb_ci:.4f}")
         print(f"  Std Dev      :  {np.std(recon_gain_dbs):.4f}")
         print(f"  Min / Max    :  {np.min(recon_gain_dbs):+.4f} / {np.max(recon_gain_dbs):+.4f}")
         print("=" * 60)
 
     if swapped_scores:
         sw_mean, sw_ci = mean_confidence_interval(swapped_scores, confidence=0.95)
-        print(f"  ViSQOL Evaluation – Swapped Latent (gain={gain})  ({len(swapped_scores)} samples)")
+        print(f"  PESQ Evaluation - Swapped Latent (gain={gain})  ({len(swapped_scores)} samples)")
         print("=" * 60)
-        print(f"  Mean MOS-LQO :  {sw_mean:.4f} ± {sw_ci:.4f}")
+        print(f"  Mean PESQ    :  {sw_mean:.4f} +/- {sw_ci:.4f}")
         print(f"  Std Dev      :  {np.std(swapped_scores):.4f}")
         print(f"  Min / Max    :  {np.min(swapped_scores):.4f} / {np.max(swapped_scores):.4f}")
         print("=" * 60)
 
     if swapped_gain_dbs:
         sw_gdb_mean, sw_gdb_ci = mean_confidence_interval(swapped_gain_dbs, confidence=0.95)
-        print(f"  Gain dB vs Reference – Swapped Latent (gain={gain})  ({len(swapped_gain_dbs)} samples)")
+        print(f"  Gain dB vs Reference - Swapped Latent (gain={gain})  ({len(swapped_gain_dbs)} samples)")
         print("=" * 60)
-        print(f"  Mean Gain dB :  {sw_gdb_mean:+.4f} ± {sw_gdb_ci:.4f}")
+        print(f"  Mean Gain dB :  {sw_gdb_mean:+.4f} +/- {sw_gdb_ci:.4f}")
         print(f"  Std Dev      :  {np.std(swapped_gain_dbs):.4f}")
         print(f"  Min / Max    :  {np.min(swapped_gain_dbs):+.4f} / {np.max(swapped_gain_dbs):+.4f}")
         print("=" * 60)
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     args = argbind.parse_args()
