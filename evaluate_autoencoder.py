@@ -1,18 +1,17 @@
 """
-Evaluate an unwrapped autoencoder model using PESQ.
+Evaluate an unwrapped autoencoder model using PESQ or ViSQOL.
 
-Single-GPU usage:
+Usage:
     python evaluate_autoencoder.py \
         --model_config stable_audio_tools/configs/model_configs/autoencoders/stable_audio_2_0_vae.json \
         --ckpt_path exported_model.ckpt \
         --dataset_config stable_audio_tools/configs/dataset_configs/local_dac.json \
-        --batch_size 16 \
-        --num_workers 6 \
-        --max_samples 0          # 0 = use all samples
-        --device cuda
+        --batch_size 2 \
+        --metric pesq          # or visqol (requires building visqol from source)
 
 Requires:
     pip install pesq argbind
+    For visqol: see install.sh
 """
 
 import argbind
@@ -27,22 +26,79 @@ import torchaudio
 import torchaudio.transforms as T
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from pesq import pesq
 
 from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models.factory import create_model_from_config
 from stable_audio_tools.models.utils import copy_state_dict, load_ckpt_state_dict
 
 
-PESQ_SAMPLE_RATE = 16000
+# ---------------------------------------------------------------------------
+# Metric backends
+# ---------------------------------------------------------------------------
+
+class PESQBackend:
+    SAMPLE_RATE = 16000
+
+    def __init__(self):
+        from pesq import pesq, NoUtterancesError
+        self._pesq = pesq
+        self._no_utt = NoUtterancesError
+
+    def __call__(self, ref: np.ndarray, deg: np.ndarray) -> float:
+        try:
+            return self._pesq(self.SAMPLE_RATE, ref, deg, "wb")
+        except self._no_utt:
+            return float("nan")
+
+    @property
+    def name(self):
+        return "PESQ"
+
+    @property
+    def score_label(self):
+        return "Mean PESQ"
+
+    @property
+    def sample_rate(self):
+        return self.SAMPLE_RATE
 
 
-def compute_pesq(reference: np.ndarray, degraded: np.ndarray) -> float:
-    """Compute wideband PESQ between a reference and degraded signal.
-    Both inputs should be 1-D float64 numpy arrays at 16 kHz.
-    """
-    return pesq(PESQ_SAMPLE_RATE, reference, degraded, "wb")
+class ViSQOLBackend:
+    SAMPLE_RATE = 48000
 
+    def __init__(self, speech_mode: bool = False):
+        from visqol import visqol_lib_py
+        from visqol.pb2 import visqol_config_pb2
+
+        config = visqol_config_pb2.VisqolConfig()
+        config.audio.sample_rate = self.SAMPLE_RATE
+        config.options.use_speech_scoring = speech_mode
+        svr_model_name = ("lattice_tcditool_in_speech.tflite" if speech_mode
+                          else "libsvm_nu_svr_model.txt")
+        config.options.svr_model_path = os.path.join(
+            os.path.dirname(visqol_lib_py.__file__), "model", svr_model_name)
+        self._api = visqol_lib_py.VisqolApi()
+        self._api.Create(config)
+
+    def __call__(self, ref: np.ndarray, deg: np.ndarray) -> float:
+        return self._api.Measure(ref, deg).moslqo
+
+    @property
+    def name(self):
+        return "ViSQOL"
+
+    @property
+    def score_label(self):
+        return "Mean MOS-LQO"
+
+    @property
+    def sample_rate(self):
+        return self.SAMPLE_RATE
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def gain_db(reference: np.ndarray, degraded: np.ndarray) -> float:
     return 10.0 * np.log10(np.mean(degraded ** 2) / (np.mean(reference ** 2) + 1e-12))
@@ -57,6 +113,10 @@ def mean_confidence_interval(data, confidence=0.95):
     return mean, scipy.stats.sem(a) * scipy.stats.t.ppf((1 + confidence) / 2.0, n - 1)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 @argbind.bind(without_prefix=True)
 def evaluate(
     model_config: str = "",
@@ -66,12 +126,23 @@ def evaluate(
     num_workers: int = 6,
     max_samples: int = 0,
     device: str = "cuda",
+    metric: str = "pesq",
+    speech_mode: bool = False,
     out_path: str = "",
     gain: float = 2.0,
 ):
     assert model_config, "--model_config is required"
     assert ckpt_path, "--ckpt_path is required"
     assert dataset_config, "--dataset_config is required"
+
+    if metric == "pesq":
+        backend = PESQBackend()
+    elif metric == "visqol":
+        backend = ViSQOLBackend(speech_mode=speech_mode)
+    else:
+        raise ValueError(f"Unknown metric: {metric}. Use 'pesq' or 'visqol'.")
+
+    print(f"Using metric: {backend.name}")
 
     save_audio = bool(out_path)
     if save_audio:
@@ -104,8 +175,9 @@ def evaluate(
         shuffle=False,
     )
 
-    resampler = (T.Resample(model_cfg["sample_rate"], PESQ_SAMPLE_RATE)
-                 if model_cfg["sample_rate"] != PESQ_SAMPLE_RATE else None)
+    metric_sr = backend.sample_rate
+    resampler = (T.Resample(model_cfg["sample_rate"], metric_sr)
+                 if model_cfg["sample_rate"] != metric_sr else None)
 
     scores = []
     swapped_scores = []
@@ -149,16 +221,18 @@ def evaluate(
             deg_sw_np = deg_sw.numpy().astype(np.float64)
 
             try:
-                score = compute_pesq(ref_np, deg_np)
-                scores.append(score)
+                score = backend(ref_np, deg_np)
+                if not np.isnan(score):
+                    scores.append(score)
             except Exception as e:
-                print(f"\n[WARNING] PESQ failed on sample {total_processed} (reconstructed): {e}", file=sys.stderr)
+                print(f"\n[WARNING] {backend.name} failed on sample {total_processed} (reconstructed): {e}", file=sys.stderr)
 
             try:
-                sw_score = compute_pesq(ref_np, deg_sw_np)
-                swapped_scores.append(sw_score)
+                sw_score = backend(ref_np, deg_sw_np)
+                if not np.isnan(sw_score):
+                    swapped_scores.append(sw_score)
             except Exception as e:
-                print(f"\n[WARNING] PESQ failed on sample {total_processed} (swapped): {e}", file=sys.stderr)
+                print(f"\n[WARNING] {backend.name} failed on sample {total_processed} (swapped): {e}", file=sys.stderr)
 
             recon_gain_dbs.append(gain_db(ref_np, deg_np))
             swapped_gain_dbs.append(gain_db(ref_np, deg_sw_np))
@@ -173,7 +247,7 @@ def evaluate(
 
             if scores:
                 pbar.set_postfix(
-                    pesq=f"{np.mean(scores):.4f}",
+                    score=f"{np.mean(scores):.4f}",
                     swapped=f"{np.mean(swapped_scores):.4f}" if swapped_scores else "n/a",
                     r_dB=f"{np.mean(recon_gain_dbs):+.2f}",
                     sw_dB=f"{np.mean(swapped_gain_dbs):+.2f}",
@@ -187,13 +261,15 @@ def evaluate(
         print("\nNo scores were computed. Check your dataset / model.")
         return
 
+    label = backend.score_label
+
     print("\n" + "=" * 60)
 
     if scores:
         mean, ci = mean_confidence_interval(scores, confidence=0.95)
-        print(f"  PESQ Evaluation - Reconstructed  ({len(scores)} samples)")
+        print(f"  {backend.name} Evaluation - Reconstructed  ({len(scores)} samples)")
         print("=" * 60)
-        print(f"  Mean PESQ    :  {mean:.4f} +/- {ci:.4f}")
+        print(f"  {label:14s}:  {mean:.4f} +/- {ci:.4f}")
         print(f"  Std Dev      :  {np.std(scores):.4f}")
         print(f"  Min / Max    :  {np.min(scores):.4f} / {np.max(scores):.4f}")
         print("=" * 60)
@@ -209,9 +285,9 @@ def evaluate(
 
     if swapped_scores:
         sw_mean, sw_ci = mean_confidence_interval(swapped_scores, confidence=0.95)
-        print(f"  PESQ Evaluation - Swapped Latent (gain={gain})  ({len(swapped_scores)} samples)")
+        print(f"  {backend.name} Evaluation - Swapped Latent (gain={gain})  ({len(swapped_scores)} samples)")
         print("=" * 60)
-        print(f"  Mean PESQ    :  {sw_mean:.4f} +/- {sw_ci:.4f}")
+        print(f"  {label:14s}:  {sw_mean:.4f} +/- {sw_ci:.4f}")
         print(f"  Std Dev      :  {np.std(swapped_scores):.4f}")
         print(f"  Min / Max    :  {np.min(swapped_scores):.4f} / {np.max(swapped_scores):.4f}")
         print("=" * 60)
