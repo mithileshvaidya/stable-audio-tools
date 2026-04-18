@@ -68,7 +68,7 @@ def unfold_channels_from_batch(x, channels):
     return x
 
 class ResidualUnit(nn.Module):
-    def __init__(self, in_channels, out_channels, dilation, use_snake=False, antialias_activation=False):
+    def __init__(self, in_channels, out_channels, dilation, use_snake=False, antialias_activation=False, use_rmsnorm=False):
         super().__init__()
         
         self.dilation = dilation
@@ -76,9 +76,11 @@ class ResidualUnit(nn.Module):
         padding = (dilation * (7-1)) // 2
 
         self.layers = nn.Sequential(
+            RMSNorm1d(in_channels) if use_rmsnorm else nn.Identity(),
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
             WNConv1d(in_channels=in_channels, out_channels=out_channels,
                       kernel_size=7, dilation=dilation, padding=padding),
+            RMSNorm1d(out_channels) if use_rmsnorm else nn.Identity(),
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
             WNConv1d(in_channels=out_channels, out_channels=out_channels,
                       kernel_size=1)
@@ -243,16 +245,16 @@ class TAAEDecoder(nn.Module):
         return self.layers(x)
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False):
+    def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False, use_rmsnorm=False):
         super().__init__()
 
         self.layers = nn.Sequential(
             ResidualUnit(in_channels=in_channels,
-                         out_channels=in_channels, dilation=1, use_snake=use_snake),
+                         out_channels=in_channels, dilation=1, use_snake=use_snake, use_rmsnorm=use_rmsnorm),
             ResidualUnit(in_channels=in_channels,
-                         out_channels=in_channels, dilation=3, use_snake=use_snake),
+                         out_channels=in_channels, dilation=3, use_snake=use_snake, use_rmsnorm=use_rmsnorm),
             ResidualUnit(in_channels=in_channels,
-                         out_channels=in_channels, dilation=9, use_snake=use_snake),
+                         out_channels=in_channels, dilation=9, use_snake=use_snake, use_rmsnorm=use_rmsnorm),
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
             WNConv1d(in_channels=in_channels, out_channels=out_channels,
                       kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2)),
@@ -262,7 +264,7 @@ class EncoderBlock(nn.Module):
         return self.layers(x)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False, use_nearest_upsample=False):
+    def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False, use_nearest_upsample=False, use_rmsnorm=False):
         super().__init__()
 
         if use_nearest_upsample:
@@ -284,11 +286,11 @@ class DecoderBlock(nn.Module):
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
             upsample_layer,
             ResidualUnit(in_channels=out_channels, out_channels=out_channels,
-                         dilation=1, use_snake=use_snake),
+                         dilation=1, use_snake=use_snake, use_rmsnorm=use_rmsnorm),
             ResidualUnit(in_channels=out_channels, out_channels=out_channels,
-                         dilation=3, use_snake=use_snake),
+                         dilation=3, use_snake=use_snake, use_rmsnorm=use_rmsnorm),
             ResidualUnit(in_channels=out_channels, out_channels=out_channels,
-                         dilation=9, use_snake=use_snake),
+                         dilation=9, use_snake=use_snake, use_rmsnorm=use_rmsnorm),
         )
 
     def forward(self, x):
@@ -303,6 +305,7 @@ class OobleckEncoder(nn.Module):
                  strides = [2, 4, 8, 8],
                  use_snake=False,
                  antialias_activation=False,
+                 use_rmsnorm=False,
                  **kwargs
         ):
         super().__init__()
@@ -317,9 +320,10 @@ class OobleckEncoder(nn.Module):
         ]
         
         for i in range(self.depth-1):
-            layers += [EncoderBlock(in_channels=c_mults[i]*channels, out_channels=c_mults[i+1]*channels, stride=strides[i], use_snake=use_snake)]
+            layers += [EncoderBlock(in_channels=c_mults[i]*channels, out_channels=c_mults[i+1]*channels, stride=strides[i], use_snake=use_snake, use_rmsnorm=use_rmsnorm)]
 
         layers += [
+            RMSNorm1d(c_mults[-1] * channels) if use_rmsnorm else nn.Identity(),
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=c_mults[-1] * channels),
             WNConv1d(in_channels=c_mults[-1]*channels, out_channels=latent_dim, kernel_size=3, padding=1)
         ]
@@ -341,6 +345,7 @@ class OobleckDecoder(nn.Module):
                  antialias_activation=False,
                  use_nearest_upsample=False,
                  final_tanh=True,
+                 use_rmsnorm=False,
                  **kwargs):
         super().__init__()
         self.out_channels = out_channels
@@ -360,11 +365,13 @@ class OobleckDecoder(nn.Module):
                 stride=strides[i-1], 
                 use_snake=use_snake, 
                 antialias_activation=antialias_activation,
-                use_nearest_upsample=use_nearest_upsample
+                use_nearest_upsample=use_nearest_upsample,
+                use_rmsnorm=use_rmsnorm
                 )
             ]
 
         layers += [
+            RMSNorm1d(c_mults[0] * channels) if use_rmsnorm else nn.Identity(),
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=c_mults[0] * channels),
             WNConv1d(in_channels=c_mults[0] * channels, out_channels=out_channels, kernel_size=7, padding=3, bias=False),
             nn.Tanh() if final_tanh else nn.Identity()
@@ -380,9 +387,8 @@ class DACEncoderWrapper(nn.Module):
     def __init__(self, in_channels=1, **kwargs):
         super().__init__()
 
-        from dac.model.dac import Encoder as DACEncoder
+        from .dac_model import Encoder as DACEncoder
 
-        kwargs.pop("use_rmsnorm", None)
         latent_dim = kwargs.pop("latent_dim", None)
 
         encoder_out_dim = kwargs["d_model"] * (2 ** len(kwargs["strides"]))
@@ -404,9 +410,7 @@ class DACDecoderWrapper(nn.Module):
     def __init__(self, latent_dim, out_channels=1, **kwargs):
         super().__init__()
 
-        from dac.model.dac import Decoder as DACDecoder
-
-        kwargs.pop("use_rmsnorm", None)
+        from .dac_model import Decoder as DACDecoder
 
         self.decoder = DACDecoder(**kwargs, input_channel = latent_dim, d_out=out_channels)
 
@@ -428,8 +432,7 @@ class AudioAutoencoder(nn.Module):
         pretransform: Pretransform = None,
         in_channels = None,
         out_channels = None,
-        soft_clip = False,
-        use_rmsnorm = False
+        soft_clip = False
     ):
         super().__init__()
 
@@ -459,8 +462,6 @@ class AudioAutoencoder(nn.Module):
 
         self.soft_clip = soft_clip
 
-        self.latent_rmsnorm = RMSNorm1d(latent_dim) if use_rmsnorm else None
- 
         self.is_discrete = self.bottleneck is not None and self.bottleneck.is_discrete
 
     def encode(self, audio, skip_bottleneck: bool = False, return_info=False, skip_pretransform=False, iterate_batch=False, **kwargs):
@@ -520,9 +521,6 @@ class AudioAutoencoder(nn.Module):
                 latents = torch.cat(decoded, dim=0)
             else:
                 latents = self.bottleneck.decode(latents)
-
-        if self.latent_rmsnorm is not None:
-            latents = self.latent_rmsnorm(latents)
 
         if iterate_batch:
             decoded = []
@@ -917,7 +915,6 @@ def create_autoencoder_from_config(config: Dict[str, Any]):
         bottleneck = create_bottleneck_from_config(bottleneck)
 
     soft_clip = ae_config["decoder"].get("soft_clip", False)
-    use_rmsnorm = ae_config.get("use_rmsnorm", False)
 
     return AudioAutoencoder(
         encoder,
@@ -930,8 +927,7 @@ def create_autoencoder_from_config(config: Dict[str, Any]):
         pretransform=pretransform,
         in_channels=in_channels,
         out_channels=out_channels,
-        soft_clip=soft_clip,
-        use_rmsnorm=use_rmsnorm
+        soft_clip=soft_clip
     )
 
 def create_diffAE_from_config(config: Dict[str, Any]):

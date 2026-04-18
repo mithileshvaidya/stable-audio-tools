@@ -111,7 +111,7 @@
                     "gain_db_max": 6
                 },
                 "weights": {
-                    "power_channel": 0.5
+                    "power_channel": 0.02
                 }
             }
         },
