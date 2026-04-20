@@ -17,17 +17,17 @@ NAMES=(
 )
 MODEL_CONFIGS=(
     "${CODECS_DIR}/vae1_baseline_config.json"
-    "${CODECS_DIR}/vae1_powerchannel_config.json"
+    "${CODECS_DIR}/vae1_pc_config.json"
     "${CODECS_DIR}/vae2_baseline_config.json"
-    "${CODECS_DIR}/vae2_powerchannel_config.json"
+    "${CODECS_DIR}/vae2_pc_config.json"
     "${CODECS_DIR}/vae1_pc_v1_weight_0p5_config.json"
     "${CODECS_DIR}/vae1_pc_v1_weight_0p75_config.json"
 )
 CKPTS=(
-    "${CODECS_DIR}/vae1_baseline.ckpt"
-    "${CODECS_DIR}/vae1_powerchannel.ckpt"
-    "${CODECS_DIR}/vae2_baseline.ckpt"
-    "${CODECS_DIR}/vae2_powerchannel.ckpt"
+    "/data/mithilesh/vae_paper/codecs_alejandro/vae1_baseline.ckpt"
+    "/data/mithilesh/vae_paper/codecs_alejandro/vae1_pc.ckpt"
+    "/data/mithilesh/vae_paper/codecs_alejandro/vae2_baseline.ckpt"
+    "/data/mithilesh/vae_paper/codecs_alejandro/vae2_pc.ckpt"
     "${CODECS_DIR}/vae1_pc_v1_weight_0p5.ckpt"
     "${CODECS_DIR}/vae1_pc_v1_weight_0p75.ckpt"
 )
@@ -109,10 +109,10 @@ for entry in entries:
     gdb = gdb_re.findall(text)
 
     def fmt_mos(p, i):
-        return f"{float(p[i][0]):.4f} ± {float(p[i][1]):.4f}" if len(p) > i else "n/a"
+        return f"{float(p[i][0]):.2f} ± {float(p[i][1]):.2f}" if len(p) > i else "n/a"
 
     def fmt_db(p, i):
-        return f"{float(p[i][0]):+.4f} ± {float(p[i][1]):.4f}" if len(p) > i else "n/a"
+        return f"{float(p[i][0]):+.2f} ± {float(p[i][1]):.2f}" if len(p) > i else "n/a"
 
     rows.append((
         name,
